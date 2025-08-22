@@ -455,24 +455,37 @@ function showLLMView() {{
 """
 
 
-def derive_temp_output_path(repo_url: str) -> pathlib.Path:
-    """Derive a temporary output path from the repo URL."""
+def derive_temp_output_path(repo_url: str, for_llm: bool = False) -> pathlib.Path:
+    """Derive a temporary output path from the repo URL or local path."""
     # Extract repo name from URL like https://github.com/owner/repo or https://github.com/owner/repo.git
-    parts = repo_url.rstrip('/').split('/')
-    if len(parts) >= 2:
-        repo_name = parts[-1]
-        if repo_name.endswith('.git'):
-            repo_name = repo_name[:-4]
-        filename = f"{repo_name}.html"
+    # or use the directory name for local paths.
+    repo_path = pathlib.Path(repo_url)
+    if repo_path.is_dir():
+        # For local directories, use the directory name
+        repo_name = repo_path.resolve().name
     else:
-        filename = "repo.html"
+        # Assume it's a URL, extract repo name
+        parts = repo_url.rstrip('/').split('/')
+        if len(parts) >= 2:
+            repo_name = parts[-1]
+            if repo_name.endswith('.git'):
+                repo_name = repo_name[:-4]
+        else:
+            repo_name = "repo"
 
+    # Determine the correct suffix based on whether it's for LLM output
+    if for_llm:
+        suffix = ".txt"
+    else:
+        suffix = ".html"
+
+    filename = f"{repo_name}{suffix}"
     return pathlib.Path(tempfile.gettempdir()) / filename
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Flatten a GitHub repo to a single HTML page")
-    ap.add_argument("repo_url", help="GitHub repo URL (https://github.com/owner/repo[.git])")
+    ap = argparse.ArgumentParser(description="Flatten a GitHub repo or a local directory to a single HTML page or text file")
+    ap.add_argument("repo_source", help="GitHub repo URL or local directory path (https://github.com/owner/repo[.git])")
     ap.add_argument("-o", "--out", help="Output file path (default: temporary file derived from repo name)")
     ap.add_argument("--max-bytes", type=int, default=MAX_DEFAULT_BYTES, help="Max file size to render (bytes); larger files are listed but skipped")
     ap.add_argument("--no-open", action="store_true", help="Don't open the HTML file in browser after generation")
@@ -480,20 +493,34 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.out is None:
-        if args.llm or args.l:
-            base_path = derive_temp_output_path(args.repo_url)
+        if args.llm:
+            base_path = derive_temp_output_path(args.repo_source)
             args.out = str(base_path.with_suffix('.txt'))
         else:
-            args.out = str(derive_temp_output_path(args.repo_url))
+            args.out = str(derive_temp_output_path(args.repo_source))
 
-    tmpdir = tempfile.mkdtemp(prefix="flatten_repo_")
-    repo_dir = pathlib.Path(tmpdir, "repo")
+    source_path = pathlib.Path(args.repo_source)
+    is_local_repo = source_path.is_dir() and (source_path / ".git").is_dir()
+    tmpdir = None  # Initialize tmpdir to None
 
-    try:
-        print(f"📁 Cloning {args.repo_url} to temporary directory: {repo_dir}", file=sys.stderr)
-        git_clone(args.repo_url, str(repo_dir))
+    if is_local_repo:
+        repo_dir = source_path.resolve()
+        # For a local repo, use the directory name as the "URL" in the report
+        repo_url = str(repo_dir)
+        print(f"📁 Using local repository: {repo_dir}", file=sys.stderr)
+        head = git_head_commit(str(repo_dir))
+        print(f"✓ Local repo identified (HEAD: {head[:8]})", file=sys.stderr)
+    else:
+        # If not a local dir, assume it's a URL to be cloned
+        repo_url = args.repo_source
+        tmpdir = tempfile.mkdtemp(prefix="flatten_repo_")
+        repo_dir = pathlib.Path(tmpdir, "repo")
+        print(f"📁 Cloning {repo_url} to temporary directory: {repo_dir}", file=sys.stderr)
+        git_clone(repo_url, str(repo_dir))
         head = git_head_commit(str(repo_dir))
         print(f"✓ Clone complete (HEAD: {head[:8]})", file=sys.stderr)
+
+    try:
 
         print(f"📊 Scanning files in {repo_dir}...", file=sys.stderr)
         infos = collect_files(repo_dir, args.max_bytes)
@@ -501,7 +528,7 @@ def main() -> int:
         skipped_count = len(infos) - rendered_count
         print(f"✓ Found {len(infos)} files total ({rendered_count} will be rendered, {skipped_count} skipped)", file=sys.stderr)
 
-        if args.llm or args.l:
+        if args.llm:
             print(f"🔨 Generating LLM text...", file=sys.stderr)
             cxml_text = generate_cxml_text(infos, repo_dir)
             
@@ -514,7 +541,7 @@ def main() -> int:
             return 0
 
         print(f"🔨 Generating HTML...", file=sys.stderr)
-        html_out = build_html(args.repo_url, repo_dir, head, infos)
+        html_out = build_html(repo_url, repo_dir, head, infos)
 
         out_path = pathlib.Path(args.out)
         print(f"💾 Writing HTML file: {out_path.resolve()}", file=sys.stderr)
@@ -526,10 +553,11 @@ def main() -> int:
             print(f"🌐 Opening {out_path} in browser...", file=sys.stderr)
             webbrowser.open(f"file://{out_path.resolve()}")
 
-        print(f"🗑️  Cleaning up temporary directory: {tmpdir}", file=sys.stderr)
         return 0
     finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        if tmpdir:
+            print(f"🗑️  Cleaning up temporary directory: {tmpdir}", file=sys.stderr)
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 if __name__ == "__main__":
