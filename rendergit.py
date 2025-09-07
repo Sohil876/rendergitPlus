@@ -9,7 +9,6 @@ import html
 import os
 import pathlib
 import shutil
-import subprocess
 import sys
 import tempfile
 import webbrowser
@@ -17,6 +16,7 @@ from dataclasses import dataclass
 from typing import List
 
 # External deps
+from git import Repo
 from pygments import highlight
 from pygments.formatters import HtmlFormatter
 from pygments.lexers import get_lexer_for_filename, TextLexer
@@ -32,10 +32,12 @@ BINARY_EXTENSIONS = {
 }
 MARKDOWN_EXTENSIONS = {".md", ".markdown", ".mdown", ".mkd", ".mkdn"}
 
+
 @dataclass
 class RenderDecision:
     include: bool
     reason: str  # "ok" | "binary" | "too_large" | "ignored"
+
 
 @dataclass
 class FileInfo:
@@ -45,50 +47,25 @@ class FileInfo:
     decision: RenderDecision
 
 
-def run(cmd: List[str], cwd: str | None = None, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, cwd=cwd, check=check, text=True, capture_output=True)
-
-
-def git_clone(url: str, dst: str) -> None:
-    run(["git", "clone", "--depth", "1", url, dst])
-
-
-def git_head_commit(repo_dir: str) -> str:
-    try:
-        cp = run(["git", "rev-parse", "HEAD"], cwd=repo_dir)
-        return cp.stdout.strip()
-    except Exception:
-        return "(unknown)"
-
-
 def bytes_human(n: int) -> str:
     """Human-readable bytes: 1 decimal for KiB and above, integer for B."""
     units = ["B", "KiB", "MiB", "GiB", "TiB"]
-    f = float(n)
-    i = 0
+    f, i = float(n), 0
     while f >= 1024.0 and i < len(units) - 1:
         f /= 1024.0
         i += 1
-    if i == 0:
-        return f"{int(f)} {units[i]}"
-    else:
-        return f"{f:.1f} {units[i]}"
+    return f"{int(f)} {units[i]}" if i == 0 else f"{f:.1f} {units[i]}"
 
 
 def looks_binary(path: pathlib.Path) -> bool:
-    ext = path.suffix.lower()
-    if ext in BINARY_EXTENSIONS:
+    if path.suffix.lower() in BINARY_EXTENSIONS:
         return True
     try:
-        with path.open("rb") as f:
-            chunk = f.read(8192)
-        if b"\x00" in chunk:
-            return True
         # Heuristic: try UTF-8 decode; if it hard-fails, likely binary
-        try:
-            chunk.decode("utf-8")
-        except UnicodeDecodeError:
+        data = path.open("rb").read(8192)
+        if b"\x00" in data:
             return True
+        data.decode("utf-8")
         return False
     except Exception:
         # If unreadable, treat as binary to be safe
@@ -111,20 +88,23 @@ def decide_file(path: pathlib.Path, repo_root: pathlib.Path, max_bytes: int) -> 
     return FileInfo(path, rel, size, RenderDecision(True, "ok"))
 
 
+def get_tracked_files(repo_root: pathlib.Path) -> set[str]:
+    repo = Repo(repo_root)
+    return set(repo.git.ls_files().splitlines())
+
+
 def collect_files(repo_root: pathlib.Path, max_bytes: int) -> List[FileInfo]:
+    tracked = get_tracked_files(repo_root)
     infos: List[FileInfo] = []
-    for p in sorted(repo_root.rglob("*")):
-        if p.is_symlink():
-            continue
+    for rel in sorted(tracked):
+        p = repo_root / rel
         if p.is_file():
             infos.append(decide_file(p, repo_root, max_bytes))
     return infos
 
 
 def generate_tree_fallback(root: pathlib.Path) -> str:
-    """Minimal tree-like output if `tree` command is missing."""
     lines: List[str] = []
-    prefix_stack: List[str] = []
 
     def walk(dir_path: pathlib.Path, prefix: str = ""):
         entries = [e for e in dir_path.iterdir() if e.name != ".git"]
@@ -140,14 +120,6 @@ def generate_tree_fallback(root: pathlib.Path) -> str:
     lines.append(root.name)
     walk(root)
     return "\n".join(lines)
-
-
-def try_tree_command(root: pathlib.Path) -> str:
-    try:
-        cp = run(["tree", "-a", "."], cwd=str(root))
-        return cp.stdout
-    except Exception:
-        return generate_tree_fallback(root)
 
 
 def read_text(path: pathlib.Path) -> str:
@@ -212,8 +184,7 @@ def build_html(repo_url: str, repo_dir: pathlib.Path, head_commit: str, infos: L
     total_files = len(rendered) + len(skipped_binary) + len(skipped_large) + len(skipped_ignored)
 
     # Directory tree
-    tree_text = try_tree_command(repo_dir)
-
+    tree_text = generate_tree_fallback(repo_dir)
     # Generate CXML text for LLM view
     cxml_text = generate_cxml_text(infos, repo_dir)
 
@@ -231,10 +202,9 @@ def build_html(repo_url: str, repo_dir: pathlib.Path, head_commit: str, infos: L
     sections: List[str] = []
     for i in rendered:
         anchor = slugify(i.rel)
-        p = i.path
-        ext = p.suffix.lower()
+        ext = i.path.suffix.lower()
         try:
-            text = read_text(p)
+            text = read_text(i.path)
             if ext in MARKDOWN_EXTENSIONS:
                 body_html = render_markdown_text(text)
             else:
@@ -255,23 +225,20 @@ def build_html(repo_url: str, repo_dir: pathlib.Path, head_commit: str, infos: L
         if not items:
             return ""
         lis = [
-            f"<li><code>{html.escape(i.rel)}</code> "
-            f"<span class='muted'>({bytes_human(i.size)})</span></li>"
+            f'<li><code>{html.escape(i.rel)}</code> <span class="muted">({bytes_human(i.size)})</span></li>'
             for i in items
         ]
         return (
-            f"<details open><summary>{html.escape(title)} ({len(items)})</summary>"
-            f"<ul class='skip-list'>\n" + "\n".join(lis) + "\n</ul></details>"
+            f'<details open><summary>{html.escape(title)} ({len(items)})</summary>'
+            f'<ul class="skip-list">\n' + "\n".join(lis) + "\n</ul></details>"
         )
 
-    skipped_html = (
-        render_skip_list("Skipped binaries", skipped_binary) +
-        render_skip_list("Skipped large files", skipped_large)
+    skipped_html = render_skip_list("Skipped binaries", skipped_binary) + render_skip_list(
+        "Skipped large files", skipped_large
     )
 
     # HTML with left sidebar TOC
-    return f"""
-<!DOCTYPE html>
+    return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
@@ -412,7 +379,7 @@ def build_html(repo_url: str, repo_dir: pathlib.Path, head_commit: str, infos: L
         {skipped_html}
       </section>
 
-      {''.join(sections)}
+      {"".join(sections)}
     </div>
 
     <div id="llm-view">
@@ -465,22 +432,11 @@ def derive_temp_output_path(repo_url: str, for_llm: bool = False) -> pathlib.Pat
         repo_name = repo_path.resolve().name
     else:
         # Assume it's a URL, extract repo name
-        parts = repo_url.rstrip('/').split('/')
-        if len(parts) >= 2:
-            repo_name = parts[-1]
-            if repo_name.endswith('.git'):
-                repo_name = repo_name[:-4]
-        else:
-            repo_name = "repo"
-
+        parts = repo_url.rstrip("/").split("/")
+        repo_name = parts[-1].removesuffix(".git") if len(parts) >= 2 else "repo"
     # Determine the correct suffix based on whether it's for LLM output
-    if for_llm:
-        suffix = ".txt"
-    else:
-        suffix = ".html"
-
-    filename = f"{repo_name}{suffix}"
-    return pathlib.Path(tempfile.gettempdir()) / filename
+    suffix = ".txt" if for_llm else ".html"
+    return pathlib.Path(tempfile.gettempdir()) / f"{repo_name}{suffix}"
 
 
 def main() -> int:
@@ -494,21 +450,22 @@ def main() -> int:
 
     if args.out is None:
         if args.llm:
-            base_path = derive_temp_output_path(args.repo_source)
-            args.out = str(base_path.with_suffix('.txt'))
+            base_path = derive_temp_output_path(args.repo_source, for_llm=True)
+            args.out = str(base_path)
         else:
             args.out = str(derive_temp_output_path(args.repo_source))
 
     source_path = pathlib.Path(args.repo_source)
     is_local_repo = source_path.is_dir() and (source_path / ".git").is_dir()
-    tmpdir = None  # Initialize tmpdir to None
+    tmpdir = None # Initialize tmpdir to None
 
     if is_local_repo:
         repo_dir = source_path.resolve()
         # For a local repo, use the directory name as the "URL" in the report
         repo_url = str(repo_dir)
         print(f"📁 Using local repository: {repo_dir}", file=sys.stderr)
-        head = git_head_commit(str(repo_dir))
+        repo = Repo(repo_dir)
+        head = repo.head.commit.hexsha
         print(f"✓ Local repo identified (HEAD: {head[:8]})", file=sys.stderr)
     else:
         # If not a local dir, assume it's a URL to be cloned
@@ -516,42 +473,37 @@ def main() -> int:
         tmpdir = tempfile.mkdtemp(prefix="flatten_repo_")
         repo_dir = pathlib.Path(tmpdir, "repo")
         print(f"📁 Cloning {repo_url} to temporary directory: {repo_dir}", file=sys.stderr)
-        git_clone(repo_url, str(repo_dir))
-        head = git_head_commit(str(repo_dir))
+        Repo.clone_from(repo_url, repo_dir, depth=1)
+        repo = Repo(repo_dir)
+        head = repo.head.commit.hexsha
         print(f"✓ Clone complete (HEAD: {head[:8]})", file=sys.stderr)
 
     try:
-
         print(f"📊 Scanning files in {repo_dir}...", file=sys.stderr)
         infos = collect_files(repo_dir, args.max_bytes)
         rendered_count = sum(1 for i in infos if i.decision.include)
         skipped_count = len(infos) - rendered_count
         print(f"✓ Found {len(infos)} files total ({rendered_count} will be rendered, {skipped_count} skipped)", file=sys.stderr)
 
+        out_path = pathlib.Path(args.out)
         if args.llm:
-            print(f"🔨 Generating LLM text...", file=sys.stderr)
+            print("🔨 Generating LLM text...", file=sys.stderr)
             cxml_text = generate_cxml_text(infos, repo_dir)
-            
-            out_path = pathlib.Path(args.out)
             print(f"💾 Writing text file: {out_path.resolve()}", file=sys.stderr)
             out_path.write_text(cxml_text, encoding="utf-8")
             file_size = out_path.stat().st_size
             print(f"✓ Wrote {bytes_human(file_size)} to {out_path}", file=sys.stderr)
-            
-            return 0
+        else:
+            print("🔨 Generating HTML...", file=sys.stderr)
+            html_out = build_html(repo_url, repo_dir, head, infos)
+            print(f"💾 Writing HTML file: {out_path.resolve()}", file=sys.stderr)
+            out_path.write_text(html_out, encoding="utf-8")
+            file_size = out_path.stat().st_size
+            print(f"✓ Wrote {bytes_human(file_size)} to {out_path}", file=sys.stderr)
 
-        print(f"🔨 Generating HTML...", file=sys.stderr)
-        html_out = build_html(repo_url, repo_dir, head, infos)
-
-        out_path = pathlib.Path(args.out)
-        print(f"💾 Writing HTML file: {out_path.resolve()}", file=sys.stderr)
-        out_path.write_text(html_out, encoding="utf-8")
-        file_size = out_path.stat().st_size
-        print(f"✓ Wrote {bytes_human(file_size)} to {out_path}", file=sys.stderr)
-
-        if not args.no_open:
-            print(f"🌐 Opening {out_path} in browser...", file=sys.stderr)
-            webbrowser.open(f"file://{out_path.resolve()}")
+            if not args.no_open:
+                print(f"🌐 Opening {out_path} in browser...", file=sys.stderr)
+                webbrowser.open(f"file://{out_path.resolve()}")
 
         return 0
     finally:
@@ -561,4 +513,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
