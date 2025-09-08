@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Flatten a GitHub repo into a single static HTML page for fast skimming and Ctrl+F.
+Flatten a Git repo into a single static HTML page for fast skimming and Ctrl+F.
 """
 
 from __future__ import annotations
 import argparse
 import html
+import json
 import os
 import pathlib
 import shutil
@@ -14,6 +15,7 @@ import tempfile
 import webbrowser
 from dataclasses import dataclass
 from typing import List
+from typing import Any
 
 # External deps
 from git import Repo
@@ -21,6 +23,26 @@ from pygments import highlight
 from pygments.formatters import HtmlFormatter
 from pygments.lexers import get_lexer_for_filename, TextLexer
 import markdown
+
+try:
+    import python_minifier
+except ImportError:
+    python_minifier = None
+
+try:
+    import rjsmin
+except ImportError:
+    rjsmin = None
+
+try:
+    import rcssmin
+except ImportError:
+    rcssmin = None
+
+try:
+    import htmlmin
+except ImportError:
+    htmlmin = None
 
 MAX_DEFAULT_BYTES = 50 * 1024
 BINARY_EXTENSIONS = {
@@ -31,6 +53,10 @@ BINARY_EXTENSIONS = {
     ".so", ".dll", ".dylib", ".class", ".jar", ".exe", ".bin",
 }
 MARKDOWN_EXTENSIONS = {".md", ".markdown", ".mdown", ".mkd", ".mkdn"}
+MINIFIABLE_EXTENSIONS = {
+    ".py": "python", ".json": "json", ".js": "javascript", ".css": "css",
+    ".html": "html", ".htm": "html"
+}
 
 
 @dataclass
@@ -71,6 +97,32 @@ def looks_binary(path: pathlib.Path) -> bool:
         # If unreadable, treat as binary to be safe
         return True
 
+def minify_code(text: str, ext: str) -> str:
+    """Minify code based on file extension."""
+    minify_type = MINIFIABLE_EXTENSIONS.get(ext.lower())
+
+    try:
+        if minify_type == "python" and python_minifier:
+            return python_minifier.minify(text, remove_literal_statements=True)
+        elif minify_type == "javascript" and rjsmin:
+            return rjsmin.jsmin(text)
+        elif minify_type == "css" and rcssmin:
+            return rcssmin.cssmin(text)
+        elif minify_type == "html" and htmlmin:
+            return htmlmin.minify(text, remove_empty_space=True, remove_comments=True)
+        elif minify_type == "json":
+            # Use built-in json for minification
+            try:
+                parsed = json.loads(text)
+                return json.dumps(parsed, separators=(',', ':'))
+            except json.JSONDecodeError:
+                return text  # Return original if not valid JSON
+    except Exception:
+        # If no minifier available or minification fails, return original text
+        pass
+
+    return text
+
 
 def decide_file(path: pathlib.Path, repo_root: pathlib.Path, max_bytes: int) -> FileInfo:
     rel = str(path.relative_to(repo_root)).replace(os.sep, "/")
@@ -103,22 +155,36 @@ def collect_files(repo_root: pathlib.Path, max_bytes: int) -> List[FileInfo]:
     return infos
 
 
-def generate_tree_fallback(root: pathlib.Path) -> str:
-    lines: List[str] = []
+def build_git_tree(repo_root: pathlib.Path) -> str:
+    """
+    Build a directory-tree string from Git’s tracked (and unignored) files.
+    """
+    repo = Repo(repo_root)
+    # ls_files lists only tracked, non-ignored files
+    tracked = repo.git.ls_files().splitlines()
 
-    def walk(dir_path: pathlib.Path, prefix: str = ""):
-        entries = [e for e in dir_path.iterdir() if e.name != ".git"]
-        entries.sort(key=lambda e: (not e.is_dir(), e.name.lower()))
-        for i, e in enumerate(entries):
-            last = i == len(entries) - 1
+    # Build nested dict structure
+    tree: dict[str, Any] = {}
+    for path in tracked:
+        parts = path.split("/")
+        node = tree
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node.setdefault(parts[-1], None)
+
+    lines: list[str] = [repo_root.name]
+
+    def walk(node: dict[str, Any], prefix: str = ""):
+        items = sorted(node.items(), key=lambda kv: (kv[1] is None, kv[0].lower()))
+        for i, (name, subtree) in enumerate(items):
+            last = i == len(items) - 1
             branch = "└── " if last else "├── "
-            lines.append(prefix + branch + e.name)
-            if e.is_dir():
+            lines.append(f"{prefix}{branch}{name}")
+            if subtree is not None:
                 extension = "    " if last else "│   "
-                walk(e, prefix + extension)
+                walk(subtree, prefix + extension)
 
-    lines.append(root.name)
-    walk(root)
+    walk(tree)
     return "\n".join(lines)
 
 
@@ -149,7 +215,7 @@ def slugify(path_str: str) -> str:
     return "".join(out)
 
 
-def generate_cxml_text(infos: List[FileInfo], repo_dir: pathlib.Path) -> str:
+def generate_cxml_text(infos: List[FileInfo], repo_dir: pathlib.Path, minify: bool = False) -> str:
     """Generate CXML format text for LLM consumption."""
     lines = ["<documents>"]
 
@@ -161,6 +227,9 @@ def generate_cxml_text(infos: List[FileInfo], repo_dir: pathlib.Path) -> str:
 
         try:
             text = read_text(i.path)
+            # Apply minification if requested and file type is supported
+            if minify:
+                text = minify_code(text, i.path.suffix)
             lines.append(text)
         except Exception as e:
             lines.append(f"Failed to read: {str(e)}")
@@ -172,7 +241,7 @@ def generate_cxml_text(infos: List[FileInfo], repo_dir: pathlib.Path) -> str:
     return "\n".join(lines)
 
 
-def build_html(repo_url: str, repo_dir: pathlib.Path, head_commit: str, infos: List[FileInfo]) -> str:
+def build_html(repo_url: str, repo_dir: pathlib.Path, head_commit: str, infos: List[FileInfo], minify: bool = False) -> str:
     formatter = HtmlFormatter(nowrap=False)
     pygments_css = formatter.get_style_defs('.highlight')
 
@@ -184,9 +253,9 @@ def build_html(repo_url: str, repo_dir: pathlib.Path, head_commit: str, infos: L
     total_files = len(rendered) + len(skipped_binary) + len(skipped_large) + len(skipped_ignored)
 
     # Directory tree
-    tree_text = generate_tree_fallback(repo_dir)
+    tree_text = build_git_tree(repo_dir)
     # Generate CXML text for LLM view
-    cxml_text = generate_cxml_text(infos, repo_dir)
+    cxml_text = generate_cxml_text(infos, repo_dir, minify=minify)
 
     # Table of contents
     toc_items: List[str] = []
@@ -440,12 +509,13 @@ def derive_temp_output_path(repo_url: str, for_llm: bool = False) -> pathlib.Pat
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Flatten a GitHub repo or a local directory to a single HTML page or text file")
-    ap.add_argument("repo_source", help="GitHub repo URL or local directory path (https://github.com/owner/repo[.git])")
+    ap = argparse.ArgumentParser(description="Flatten a Git repository (local or remote) to a single HTML page or text file")
+    ap.add_argument("repo_source", help="Git repository URL or local git repository directory path (https://github.com/owner/repo[.git])")
     ap.add_argument("-o", "--out", help="Output file path (default: temporary file derived from repo name)")
     ap.add_argument("--max-bytes", type=int, default=MAX_DEFAULT_BYTES, help="Max file size to render (bytes); larger files are listed but skipped")
     ap.add_argument("--no-open", action="store_true", help="Don't open the HTML file in browser after generation")
     ap.add_argument("-l", "--llm", action="store_true", help="Output LLM only view (CXML text) to a text file")
+    ap.add_argument("-m", "--minify", action="store_true", help="Minify supported code files for LLM consumption (For LLM output only)")
     args = ap.parse_args()
 
     if args.out is None:
@@ -485,17 +555,19 @@ def main() -> int:
         skipped_count = len(infos) - rendered_count
         print(f"✓ Found {len(infos)} files total ({rendered_count} will be rendered, {skipped_count} skipped)", file=sys.stderr)
 
+        if args.minify:
+            print("🗜 Minification enabled for LLM content", file=sys.stderr)
         out_path = pathlib.Path(args.out)
         if args.llm:
             print("🔨 Generating LLM text...", file=sys.stderr)
-            cxml_text = generate_cxml_text(infos, repo_dir)
+            cxml_text = generate_cxml_text(infos, repo_dir, minify=args.minify)
             print(f"💾 Writing text file: {out_path.resolve()}", file=sys.stderr)
             out_path.write_text(cxml_text, encoding="utf-8")
             file_size = out_path.stat().st_size
             print(f"✓ Wrote {bytes_human(file_size)} to {out_path}", file=sys.stderr)
         else:
             print("🔨 Generating HTML...", file=sys.stderr)
-            html_out = build_html(repo_url, repo_dir, head, infos)
+            html_out = build_html(repo_url, repo_dir, head, infos, minify=args.minify)
             print(f"💾 Writing HTML file: {out_path.resolve()}", file=sys.stderr)
             out_path.write_text(html_out, encoding="utf-8")
             file_size = out_path.stat().st_size

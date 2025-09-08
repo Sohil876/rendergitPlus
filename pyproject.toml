@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rendergitPlus"
-version = "0.2.0"
-description = "Flatten a GitHub repo into a single static HTML page for fast skimming and Ctrl+F"
+version = "0.3.0"
+description = "Flatten a Git repository into a single static HTML page for fast skimming and Ctrl+F"
 readme = "README.md"
 license = "0BSD"
 authors = [
@@ -15,8 +15,12 @@ authors = [
 requires-python = ">=3.10"
 dependencies = [
     "gitpython>=3.1.45",
-    "markdown>=3.8.2",
+    "htmlmin>=0.1.12",
+    "markdown>=3.9",
     "pygments>=2.19.2",
+    "python-minifier>=3.0.0",
+    "rcssmin>=1.2.1",
+    "rjsmin>=1.2.4",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -29,7 +33,7 @@ classifiers = [
 ]
 
 [project.scripts]
-rendergit = "rendergit:main"
+rendergitplus = "rendergitplus:main"
 
 [project.urls]
 Homepage = "https://github.com/Sohil876/rendergitPlus"
