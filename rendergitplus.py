@@ -275,7 +275,11 @@ def build_html(repo_url: str, repo_dir: pathlib.Path, head_commit: str, infos: L
         try:
             text = read_text(i.path)
             if ext in MARKDOWN_EXTENSIONS:
-                body_html = render_markdown_text(text)
+                # Use Pygments Markdown lexer for syntax highlighting raw markdown text
+                from pygments.lexers.markup import MarkdownLexer
+                lexer = MarkdownLexer()
+                code_html = highlight(text, lexer, formatter)
+                body_html = f'<div class="highlight">{code_html}</div>'
             else:
                 code_html = highlight_code(text, i.rel, formatter)
                 body_html = f'<div class="highlight">{code_html}</div>'
@@ -350,10 +354,6 @@ def build_html(repo_url: str, repo_dir: pathlib.Path, head_commit: str, infos: L
   .skip-list code {{ background: #f6f8fa; padding: 0.1rem 0.3rem; border-radius: 4px; }}
   .error {{ color: #b00020; background: #fff3f3; }}
 
-  /* Hide duplicate top TOC on wide screens */
-  .toc-top {{ display: block; }}
-  @media (min-width: 1000px) {{ .toc-top {{ display: none; }} }}
-
   :target {{ scroll-margin-top: 8px; }}
 
   /* View toggle */
@@ -407,7 +407,7 @@ def build_html(repo_url: str, repo_dir: pathlib.Path, head_commit: str, infos: L
 
 <div class="page">
   <nav id="sidebar"><div class="sidebar-inner">
-      <h2>Contents ({len(rendered)})</h2>
+      <h2>Table of contents ({len(rendered)})</h2>
       <ul class="toc toc-sidebar">
         <li><a href="#top">↑ Back to top</a></li>
         {toc_html}
@@ -435,17 +435,18 @@ def build_html(repo_url: str, repo_dir: pathlib.Path, head_commit: str, infos: L
     <div id="human-view">
       <section>
         <h2>Directory tree</h2>
-        <pre>{html.escape(tree_text)}</pre>
-      </section>
-
-      <section class="toc-top">
-        <h2>Table of contents ({len(rendered)})</h2>
-        <ul class="toc">{toc_html}</ul>
+        <details>
+          <summary>Click to expand/collapse</summary>
+          <pre>{html.escape(tree_text) if tree_text else 'No directory tree content available.'}</pre>
+        </details>
       </section>
 
       <section>
         <h2>Skipped items</h2>
-        {skipped_html}
+        <details>
+          <summary>Click to expand/collapse</summary>
+          <pre>{skipped_html if skipped_html else 'No skipped items.'}</pre>
+        </details>
       </section>
 
       {"".join(sections)}
